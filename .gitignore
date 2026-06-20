@@ -1,0 +1,12 @@
+env/
+venv/
+data/raw/
+data/processed/
+*.mat
+*.pkl
+__pycache__/
+*.pyc
+*.pyo
+.ipynb_checkpoints/
+outputs/
+.vscode/
