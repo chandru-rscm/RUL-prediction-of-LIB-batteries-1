@@ -129,6 +129,22 @@ sns.set_theme(style="darkgrid", font_scale=1.05)
 fig = plt.figure(figsize=(18, 14))
 fig.suptitle("Day 1 EDA — LiB Dataset Overview", fontsize=16, fontweight="bold", y=0.98)
 
+def _baseline_capacity(q):
+    """
+    Get a stable early-cycle capacity baseline for normalization.
+    Index 0 (cycle 1) is often a near-empty formation cycle with a
+    trivial ~0 reading — skip it and use index 4 (cycle 5) or the
+    first positive value instead.
+    """
+    if len(q) == 0:
+        return np.nan
+    idx = min(4, len(q) - 1)
+    if q[idx] > 0:
+        return q[idx]
+    positive = q[q > 0]
+    return positive[0] if len(positive) > 0 else np.nan
+
+
 # ── Plot 1: Cycle life distribution ──
 ax1 = fig.add_subplot(3, 3, 1)
 ax1.hist(summary_df.cycle_life, bins=20, color="#534AB7", edgecolor="white", linewidth=0.5)
@@ -150,7 +166,7 @@ for idx, cell_id in enumerate(sample_cells):
     cell = cells[cell_id]
     q    = cell["summary"]["QDischarge"]
     c    = np.arange(1, len(q) + 1)
-    ax2.plot(c, q / q[0] * 100, color=cmap(idx), linewidth=1.0, alpha=0.85)
+    ax2.plot(c, q / _baseline_capacity(q) * 100, color=cmap(idx), linewidth=1.0, alpha=0.85)
 
 ax2.axhline(80, color="#E86540", linewidth=1.5, linestyle="--", label="80% EOL threshold")
 ax2.axhline(85, color="#BA7517", linewidth=1.0, linestyle=":",  label="85% second-life trigger")
@@ -185,13 +201,19 @@ for cid in short_ids:
     q = cells[cid]["summary"]["QDischarge"]
     if len(q) == 0:
         continue
-    ax4.plot(np.arange(1, len(q)+1), q / q[0] * 100,
+    base = _baseline_capacity(q)
+    if not np.isfinite(base) or base <= 0:
+        continue
+    ax4.plot(np.arange(1, len(q)+1), q / base * 100,
              color="#E86540", linewidth=1.0, alpha=0.7)
 for cid in long_ids:
     q = cells[cid]["summary"]["QDischarge"]
     if len(q) == 0:
         continue
-    ax4.plot(np.arange(1, len(q)+1), q / q[0] * 100,
+    base = _baseline_capacity(q)
+    if not np.isfinite(base) or base <= 0:
+        continue
+    ax4.plot(np.arange(1, len(q)+1), q / base * 100,
              color="#534AB7", linewidth=1.0, alpha=0.7)
 
 from matplotlib.lines import Line2D
@@ -231,8 +253,10 @@ soh100, life = [], []
 for cell_id, cell in cells.items():
     q = cell["summary"]["QDischarge"]
     if len(q) >= 100:
-        soh100.append(q[99] / q[0] * 100)
-        life.append(cell["cycle_life"])
+        base = _baseline_capacity(q)
+        if np.isfinite(base) and base > 0:
+            soh100.append(q[99] / base * 100)
+            life.append(cell["cycle_life"])
 ax7.scatter(soh100, life, color="#534AB7", alpha=0.6, s=30, edgecolors="white", linewidths=0.3)
 ax7.set_xlabel("SOH at cycle 100 (%)")
 ax7.set_ylabel("Total cycle life")

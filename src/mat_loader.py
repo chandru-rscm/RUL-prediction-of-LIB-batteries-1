@@ -87,9 +87,7 @@ def _load_single_mat(mat_path: str, batch_num: int) -> dict:
 
                 def _s(key):
                     try:
-                        return np.hstack(
-                            [_arr(f, s_node[key][0, j]) for j in range(s_node[key].shape[1])]
-                        )
+                        return np.array(s_node[key]).flatten()
                     except Exception:
                         return np.array([])
 
