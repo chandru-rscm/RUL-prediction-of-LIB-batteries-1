@@ -315,3 +315,92 @@ def build_sequence_cache(cells: dict, checkpoint: int = 100,
         "capacity_curve":  np.array(cap_list, dtype=np.float32),     # (N, curve_len)
         "cycle_life":      np.array(life_list, dtype=np.int32),      # (N,)
     }
+
+
+# ─────────────────────────────────────────────────────
+#  DAY 4 — MULTI-CHECKPOINT EXTRACTION (for genuine sequence models)
+# ─────────────────────────────────────────────────────
+
+def build_multi_checkpoint_dataset(cells: dict, checkpoints: list = None) -> dict:
+    """
+    Extract scalar features AND Qdlin curves at MULTIPLE checkpoint cycles
+    per cell — giving LSTM/GRU a genuine temporal sequence to learn from
+    (unlike Day 3, which only had one checkpoint, no real 'time' dimension).
+
+    checkpoints default: [10, 30, 50, 70, 100] — all safely below the
+    dataset's minimum cycle_life (148), so every cell has data at each one.
+
+    Returns a dict with:
+      cell_ids        : (N,)
+      cycle_life      : (N,)
+      feature_seq     : (N, n_checkpoints, n_features) — scalar features per checkpoint
+      qdlin_final     : (N, 1000) — Qdlin curve at the LAST checkpoint (for CNN)
+      feature_names   : list of feature column names
+    """
+    if checkpoints is None:
+        checkpoints = [10, 30, 50, 70, 100]
+
+    cell_ids, life_list = [], []
+    feature_seqs, qdlin_finals = [], []
+    feature_names = None
+    skipped = 0
+
+    for cell_id, cell in cells.items():
+        try:
+            # need every checkpoint cycle to exist
+            if not all(str(cp) in cell["cycles"] for cp in checkpoints):
+                skipped += 1
+                continue
+
+            per_cp_feats = []
+            ok = True
+            for cp in checkpoints:
+                early = max(2, cp - 5)  # small early offset relative to this checkpoint
+                feats = extract_cell_features(cell, checkpoint=cp, early=min(early, cp - 1))
+                if feats is None:
+                    ok = False
+                    break
+                feats.pop("cycle_life", None)
+                per_cp_feats.append(feats)
+
+            if not ok:
+                skipped += 1
+                continue
+
+            if feature_names is None:
+                feature_names = list(per_cp_feats[0].keys())
+
+            feat_matrix = np.array([[f[k] for k in feature_names] for f in per_cp_feats],
+                                    dtype=np.float32)   # (n_checkpoints, n_features)
+
+            if np.isnan(feat_matrix).any():
+                # fill any stray NaNs with the column's own mean across checkpoints
+                col_mean = np.nanmean(feat_matrix, axis=0)
+                inds = np.where(np.isnan(feat_matrix))
+                feat_matrix[inds] = np.take(col_mean, inds[1])
+
+            qdlin_final = cell["cycles"][str(checkpoints[-1])].get("Qdlin", np.array([]))
+            if len(qdlin_final) == 0:
+                skipped += 1
+                continue
+
+            cell_ids.append(cell_id)
+            life_list.append(int(cell["cycle_life"]))
+            feature_seqs.append(feat_matrix)
+            qdlin_finals.append(qdlin_final.astype(np.float32))
+
+        except Exception as e:
+            print(f"  [skip] {cell_id} — multi-checkpoint error: {e}")
+            skipped += 1
+            continue
+
+    print(f"Multi-checkpoint dataset: {len(cell_ids)} cells built, {skipped} skipped")
+
+    return {
+        "cell_ids":      np.array(cell_ids),
+        "cycle_life":    np.array(life_list, dtype=np.int32),
+        "feature_seq":   np.array(feature_seqs, dtype=np.float32),   # (N, n_cp, n_feat)
+        "qdlin_final":   np.array(qdlin_finals, dtype=np.float32),   # (N, 1000)
+        "feature_names": np.array(feature_names),
+        "checkpoints":   np.array(checkpoints),
+    }
