@@ -74,3 +74,101 @@ class SimpleMLP(nn.Module):
     def forward(self, x):
         # x: (batch, n_features)
         return self.net(x).squeeze(-1)
+
+
+# ─────────────────────────────────────────────────────
+#  DAY 4 — ENSEMBLE COMPONENTS
+# ─────────────────────────────────────────────────────
+
+class CNNBranch(nn.Module):
+    """
+    1D CNN over the raw Qdlin voltage-capacity curve (1000 points,
+    downsampled). Convolution kernels scan the curve for local shape
+    patterns (peak height/width/position) directly from signal —
+    complementary to the hand-engineered IC peak stats.
+    """
+
+    def __init__(self, seq_len: int, out_dim: int = 16):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv1d(1, 8, kernel_size=7, padding=3),
+            nn.ReLU(),
+            nn.MaxPool1d(2),
+            nn.Conv1d(8, 16, kernel_size=5, padding=2),
+            nn.ReLU(),
+            nn.AdaptiveAvgPool1d(1),   # global average pool — keeps params low
+        )
+        self.head = nn.Linear(16, out_dim)
+
+    def forward(self, x):
+        # x: (batch, seq_len) -> (batch, 1, seq_len) for Conv1d
+        x = x.unsqueeze(1)
+        x = self.conv(x)              # (batch, 16, 1)
+        x = x.squeeze(-1)             # (batch, 16)
+        return self.head(x)           # (batch, out_dim)
+
+
+class SequenceBranch(nn.Module):
+    """
+    LSTM or GRU over the (n_checkpoints, n_features) feature sequence —
+    learns how engineered features evolve as the battery ages.
+    """
+
+    def __init__(self, n_features: int, hidden_size: int = 24,
+                 out_dim: int = 16, cell_type: str = "lstm"):
+        super().__init__()
+        rnn_cls = nn.LSTM if cell_type == "lstm" else nn.GRU
+        self.rnn = rnn_cls(
+            input_size=n_features, hidden_size=hidden_size,
+            num_layers=1, batch_first=True,
+        )
+        # forget-gate bias init trick (LSTM only) — helps gradient flow
+        if cell_type == "lstm":
+            for name, param in self.rnn.named_parameters():
+                if "bias" in name:
+                    n = param.size(0)
+                    param.data[n // 4: n // 2].fill_(1.0)
+
+        self.head = nn.Linear(hidden_size, out_dim)
+
+    def forward(self, x):
+        # x: (batch, n_checkpoints, n_features)
+        out, state = self.rnn(x)
+        last_hidden = state[0][-1] if isinstance(state, tuple) else state[-1]
+        return self.head(last_hidden)   # (batch, out_dim)
+
+
+class RULEnsemble(nn.Module):
+    """
+    Combines CNN (raw curve shape) + LSTM + GRU (feature sequences)
+    branches. Each branch outputs a small embedding; embeddings are
+    concatenated and passed through a final regression head.
+
+    A learned scalar weight per branch lets the model lean on whichever
+    branch is most useful, rather than forcing equal-weight averaging.
+    """
+
+    def __init__(self, n_features: int, cnn_seq_len: int,
+                 branch_dim: int = 16, hidden_size: int = 24):
+        super().__init__()
+        self.cnn  = CNNBranch(cnn_seq_len, out_dim=branch_dim)
+        self.lstm = SequenceBranch(n_features, hidden_size, branch_dim, cell_type="lstm")
+        self.gru  = SequenceBranch(n_features, hidden_size, branch_dim, cell_type="gru")
+
+        self.combine_head = nn.Sequential(
+            nn.Linear(branch_dim * 3, 32),
+            nn.ReLU(),
+            nn.Dropout(0.15),
+            nn.Linear(32, 1),
+        )
+
+    def forward(self, qdlin, feature_seq):
+        # qdlin:       (batch, cnn_seq_len)
+        # feature_seq: (batch, n_checkpoints, n_features)
+        cnn_emb  = self.cnn(qdlin)
+        lstm_emb = self.lstm(feature_seq)
+        gru_emb  = self.gru(feature_seq)
+
+        combined = torch.cat([cnn_emb, lstm_emb, gru_emb], dim=-1)
+        out = self.combine_head(combined)
+        return out.squeeze(-1)
